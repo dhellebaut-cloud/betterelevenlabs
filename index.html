@@ -450,6 +450,16 @@
   }
   .primary:disabled { opacity: .5; cursor: default; }
   .wide { width: 100%; }
+  .gen-row { display: flex; gap: 8px; }
+  .gen-row .primary { flex: 1; }
+  .takes {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .studio .takes select { width: auto; padding: 8px 6px; }
   .fine { font-size: 12px; color: var(--muted); }
   .fine a { color: var(--accent); }
   .el-error {
@@ -557,8 +567,19 @@
 
   /* Queue additions */
   .q-sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
-  .q-dl { color: var(--muted); width: 28px; height: 28px; border-radius: 6px; display: grid; place-items: center; }
-  .q-dl:hover { color: var(--text); }
+  .q-dl {
+    color: #fff;
+    background: #7300c9;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: grid;
+    place-items: center;
+    flex: none;
+    transition: background .15s, transform .1s;
+  }
+  .q-dl:hover { background: #5e00a5; }
+  .q-dl:active { transform: scale(.94); }
 
   @media (max-width: 520px) {
     .player, .studio { padding: 16px; }
@@ -636,7 +657,16 @@
         <textarea id="elText" placeholder="Paste or write the voice-over text…"></textarea>
         <div class="field-foot"><span id="elCount">0 characters</span><span>⌘↩ to generate · <kbd>G</kbd> regenerate</span></div>
       </div>
-      <button class="primary wide" id="elGenBtn">Generate</button>
+      <div class="gen-row">
+        <label class="takes" title="How many versions each Generate creates. Each one uses credits.">
+          <select id="elTakes">
+            <option value="1">1 take</option>
+            <option value="2">2 takes</option>
+            <option value="3">3 takes</option>
+          </select>
+        </label>
+        <button class="primary" id="elGenBtn">Generate</button>
+      </div>
     </div>
 
     <div id="elHist" hidden>
@@ -842,13 +872,15 @@
 
   // Add an in-memory file (e.g. an ElevenLabs take) and start playing it.
   // meta: { key, name, sub }
-  function addGenerated(file, meta, autoplay = true) {
+  // Pass load = false to only add it to the list.
+  function addGenerated(file, meta, autoplay = true, load = true) {
     const existing = queue.findIndex((q) => q.key === meta.key);
-    if (existing >= 0) { loadIndex(existing, autoplay); return; }
+    if (existing >= 0) { if (load) loadIndex(existing, autoplay); return; }
     const item = { id: Math.random().toString(36).slice(2), file, duration: NaN, el: true, ...meta };
     queue.push(item);
     probeDuration(item);
-    loadIndex(queue.length - 1, autoplay);
+    if (load) loadIndex(queue.length - 1, autoplay);
+    else renderQueue();
   }
 
   function downloadItem(q) {
@@ -1387,7 +1419,7 @@
       gen: q('elGen'), hist: q('elHist'), foot: q('elFoot'), disconnect: q('elDisconnect'),
       vpBtn: q('vpBtn'), vpName: q('vpName'), vpMeta: q('vpMeta'), vpPop: q('vpPop'), vpSearch: q('vpSearch'), vpList: q('vpList'),
       model: q('elModel'), settings: q('elSettings'), vsReset: q('vsReset'), boost: q('vsBoost'),
-      title: q('elTitle'), text: q('elText'), count: q('elCount'), genBtn: q('elGenBtn'),
+      title: q('elTitle'), text: q('elText'), takes: q('elTakes'), count: q('elCount'), genBtn: q('elGenBtn'),
       histSearch: q('histSearch'), histRefresh: q('histRefresh'), histList: q('histList'), histMore: q('histMore'),
     };
     const sliders = {
@@ -1696,22 +1728,38 @@
       const timer = setInterval(tick, 1000);
       try {
         const settings = readSettings();
-        const res = await api(`/v1/text-to-speech/${encodeURIComponent(voice.voice_id)}?output_format=mp3_44100_128`, {
+        const v = voice;
+        const count = +ui.takes.value || 1;
+        // Like the ElevenLabs website: request several versions in parallel.
+        const request = () => api(`/v1/text-to-speech/${encodeURIComponent(v.voice_id)}?output_format=mp3_44100_128`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
           body: JSON.stringify({ text, model_id: ui.model.value, voice_settings: settings }),
-        });
-        const blob = await res.blob();
+        }).then((res) => res.blob());
+        const results = await Promise.allSettled(Array.from({ length: count }, request));
+
         const title = ui.title.value.trim() || text.split(/\s+/).slice(0, 5).join(' ');
-        const take = queue.filter((x) => x.takeOf === title).length + 1;
-        const fname = safeName(`${title} - ${voice.name} - take ${take}`) + '.mp3';
-        const file = new File([blob], fname, { type: 'audio/mpeg', lastModified: started });
-        addGenerated(file, {
-          key: 'el:gen:' + started,
-          name: `${title} — take ${take}`,
-          sub: voice.name,
-          takeOf: title,
+        let take = queue.filter((x) => x.takeOf === title).length;
+        let first = true;
+        results.forEach((r, i) => {
+          if (r.status !== 'fulfilled') return;
+          take++;
+          const fname = safeName(`${title} - ${v.name} - take ${take}`) + '.mp3';
+          const file = new File([r.value], fname, { type: 'audio/mpeg', lastModified: started });
+          addGenerated(file, {
+            key: `el:gen:${started}:${i}`,
+            name: `${title} — take ${take}`,
+            sub: v.name,
+            takeOf: title,
+          }, true, first);
+          first = false;
         });
+
+        const failed = results.filter((r) => r.status === 'rejected');
+        if (failed.length) {
+          showError(failed[0].reason.message);
+          toast(failed.length === results.length ? 'Generation failed' : `${failed.length} of ${results.length} takes failed`);
+        }
         histStale = true;
         loadCredits();
       } catch (e) {
@@ -1870,6 +1918,8 @@
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); generate(); }
     });
     ui.genBtn.addEventListener('click', generate);
+    ui.takes.value = store.get('el:takes') || '2';
+    ui.takes.addEventListener('change', () => store.set('el:takes', ui.takes.value));
 
     let searchTimer;
     ui.histSearch.addEventListener('input', () => {
