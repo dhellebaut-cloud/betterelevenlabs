@@ -328,6 +328,8 @@
     text-overflow: ellipsis;
   }
   .q-dur { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .q-dur.pending { color: #7300c9; animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .4; } }
   .q-item.active .q-name { font-weight: 600; color: var(--accent); }
   .q-item.active .q-num { color: var(--accent); }
 
@@ -860,9 +862,17 @@
 
   function loadIndex(i, autoplay = false) {
     if (i < 0 || i >= queue.length) return;
-    currentIdx = i;
     const q = queue[i];
-    loadFile(q.file, autoplay);
+    if (!q.file) {
+      // A take that's still generating can only be played once, from its live stream.
+      if (!q.streamUrl || q.streamUsed) { toast('Still generating…'); return; }
+      q.streamUsed = true;
+      currentIdx = i;
+      loadFile(null, autoplay, { src: q.streamUrl, key: q.key, name: q.name });
+    } else {
+      currentIdx = i;
+      loadFile(q.file, autoplay, { key: q.key });
+    }
     if (q.name) {
       els.title.textContent = q.name;
       document.title = q.name + ' · Audio Player';
@@ -939,7 +949,7 @@
     queue.forEach((q, i) => {
       const li = document.createElement('li');
       li.className = 'q-item' + (i === currentIdx ? ' active' : '');
-      li.title = q.file.name;
+      li.title = q.file ? q.file.name : q.name;
       li.addEventListener('click', () => { if (i !== currentIdx) loadIndex(i, !audio.paused); });
 
       const num = document.createElement('span');
@@ -958,7 +968,8 @@
 
       const dur = document.createElement('span');
       dur.className = 'q-dur';
-      dur.textContent = isFinite(q.duration) ? fmt(q.duration) : '';
+      dur.textContent = !q.file ? 'Generating…' : isFinite(q.duration) ? fmt(q.duration) : '';
+      if (!q.file) dur.classList.add('pending');
 
       const del = document.createElement('button');
       del.className = 'mark-del';
@@ -967,7 +978,7 @@
       del.addEventListener('click', (e) => { e.stopPropagation(); removeFromQueue(q.id); });
 
       li.append(num, name, dur);
-      if (q.el) {
+      if (q.el && q.file) {
         const dl = document.createElement('button');
         dl.className = 'q-dl';
         dl.title = 'Download';
@@ -981,24 +992,26 @@
   }
 
   /* ---------- file loading ---------- */
-  function loadFile(file, autoplay = false) {
-    if (!file) return;
+  // opts.src plays a live stream (MediaSource URL) instead of a file.
+  function loadFile(file, autoplay = false, opts = {}) {
+    if (!file && !opts.src) return;
     savePosition();
     const token = ++loadToken;
+    const name = opts.name || file.name;
 
     if (objectUrl) URL.revokeObjectURL(objectUrl);
-    objectUrl = URL.createObjectURL(file);
-    fileKey = `${file.name}:${file.size}`;
+    objectUrl = file ? URL.createObjectURL(file) : null;
+    fileKey = opts.key || `${file.name}:${file.size}`;
     peaks = null;
     marks = loadMarks();
 
-    audio.src = objectUrl;
+    audio.src = opts.src || objectUrl;
     audio.defaultPlaybackRate = rate;
     audio.playbackRate = rate;
 
-    els.title.textContent = file.name;
-    els.title.title = file.name;
-    document.title = file.name + ' · Audio Player';
+    els.title.textContent = name;
+    els.title.title = name;
+    document.title = name + ' · Audio Player';
     els.drop.hidden = true;
     els.player.hidden = false;
     renderMarks();
@@ -1018,10 +1031,18 @@
     }, { once: true });
 
     if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({ title: file.name });
+      navigator.mediaSession.metadata = new MediaMetadata({ title: name });
     }
 
-    buildPeaks(file, token);
+    if (file) buildPeaks(file, token);
+    else els.waveStatus.textContent = 'Generating…';
+  }
+
+  // Called when a streamed take has finished downloading.
+  function streamFinished(item) {
+    probeDuration(item);
+    if (queue[currentIdx] === item) buildPeaks(item.file, loadToken);
+    renderQueue();
   }
 
   async function buildPeaks(file, token) {
@@ -1341,6 +1362,7 @@
     if (now - lastSave > 3000) { lastSave = now; savePosition(); }
     if (audio.paused) { updateTimes(); draw(); }
   });
+  audio.addEventListener('durationchange', () => { updateTimes(); draw(); });
   audio.addEventListener('ended', () => {
     if (fileKey) store.del('pos:' + fileKey);
     if (currentIdx < queue.length - 1) loadIndex(currentIdx + 1, true);
@@ -1712,6 +1734,49 @@
     /* --- generate --- */
     function safeName(s) { return s.replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'voice-over'; }
 
+    const canStream = !!(window.MediaSource && MediaSource.isTypeSupported('audio/mpeg'));
+
+    // Collect a streamed take. With live = true (and browser support) it also
+    // starts playing in the player while the audio is still arriving.
+    async function readStream(res, item, live) {
+      const reader = res.body.getReader();
+      const chunks = [];
+      let sb = null;
+      let ms = null;
+
+      if (live && canStream) {
+        ms = new MediaSource();
+        item.streamUrl = URL.createObjectURL(ms);
+        const opened = new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+        loadIndex(queue.indexOf(item), true);
+        await opened;
+        try {
+          sb = ms.addSourceBuffer('audio/mpeg');
+          try { sb.mode = 'sequence'; } catch {}
+        } catch { sb = null; }
+      }
+
+      const append = (data) => new Promise((resolve, reject) => {
+        sb.addEventListener('updateend', resolve, { once: true });
+        sb.addEventListener('error', reject, { once: true });
+        sb.appendBuffer(data);
+      });
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        if (sb) {
+          // If the user switches files mid-stream, stop feeding the player but keep downloading.
+          try { await append(value); } catch { sb = null; }
+        }
+      }
+      if (sb && ms.readyState === 'open') {
+        try { ms.endOfStream(); } catch {}
+      }
+      return new Blob(chunks, { type: 'audio/mpeg' });
+    }
+
     async function generate() {
       if (!ready) { setOpen(true); return; }
       if (busy) return;
@@ -1730,34 +1795,54 @@
         const settings = readSettings();
         const v = voice;
         const count = +ui.takes.value || 1;
-        // Like the ElevenLabs website: request several versions in parallel.
-        const request = () => api(`/v1/text-to-speech/${encodeURIComponent(v.voice_id)}?output_format=mp3_44100_128`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
-          body: JSON.stringify({ text, model_id: ui.model.value, voice_settings: settings }),
-        }).then((res) => res.blob());
-        const results = await Promise.allSettled(Array.from({ length: count }, request));
-
         const title = ui.title.value.trim() || text.split(/\s+/).slice(0, 5).join(' ');
+        const body = JSON.stringify({ text, model_id: ui.model.value, voice_settings: settings });
         let take = queue.filter((x) => x.takeOf === title).length;
-        let first = true;
-        results.forEach((r, i) => {
-          if (r.status !== 'fulfilled') return;
+
+        // Add placeholders right away so the list shows what's coming.
+        const items = Array.from({ length: count }, (_, i) => {
           take++;
-          const fname = safeName(`${title} - ${v.name} - take ${take}`) + '.mp3';
-          const file = new File([r.value], fname, { type: 'audio/mpeg', lastModified: started });
-          addGenerated(file, {
+          const item = {
+            id: Math.random().toString(36).slice(2),
             key: `el:gen:${started}:${i}`,
+            file: null,
+            duration: NaN,
+            el: true,
             name: `${title} — take ${take}`,
             sub: v.name,
             takeOf: title,
-          }, true, first);
-          first = false;
+            fname: safeName(title) + '.mp3',
+          };
+          queue.push(item);
+          return item;
         });
+        renderQueue();
 
-        const failed = results.filter((r) => r.status === 'rejected');
+        // Like the ElevenLabs website: request the versions in parallel, stream
+        // them, and start playing the first one while the rest are still coming in.
+        let playing = false;
+        const results = await Promise.allSettled(items.map(async (item) => {
+          const res = await api(`/v1/text-to-speech/${encodeURIComponent(v.voice_id)}/stream?output_format=mp3_44100_128`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
+            body,
+          });
+          const playNow = !playing;
+          playing = true;
+          const blob = await readStream(res, item, playNow);
+          item.file = new File([blob], item.fname, { type: 'audio/mpeg', lastModified: started });
+          if (item.streamUrl) URL.revokeObjectURL(item.streamUrl);
+          streamFinished(item);
+          // No live playback (unsupported browser): play it now that it's complete.
+          if (playNow && !item.streamUsed) loadIndex(queue.indexOf(item), true);
+        }));
+
+        const failed = [];
+        results.forEach((r, i) => {
+          if (r.status === 'rejected') { failed.push(r.reason); removeFromQueue(items[i].id); }
+        });
         if (failed.length) {
-          showError(failed[0].reason.message);
+          showError(failed[0].message);
           toast(failed.length === results.length ? 'Generation failed' : `${failed.length} of ${results.length} takes failed`);
         }
         histStale = true;
