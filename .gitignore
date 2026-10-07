@@ -1,0 +1,6 @@
+.DS_Store
+Audio Test Files/
+*.mp3
+*.wav
+*.m4a
+.claude/
